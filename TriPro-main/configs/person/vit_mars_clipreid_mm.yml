@@ -1,0 +1,92 @@
+MODEL:
+  PRETRAIN_CHOICE: 'imagenet'
+  METRIC_LOSS_TYPE: 'triplet'
+  IF_LABELSMOOTH: 'on'
+  IF_WITH_CENTER: 'no'
+  NAME: 'ViT-B-16'
+  # NAME: 'RN50'
+  STRIDE_SIZE: [16, 16]
+  ID_LOSS_WEIGHT : 0.25
+  TRIPLET_LOSS_WEIGHT : 1.0
+  I2T_LOSS_WEIGHT : 1.0
+  SIE_CAMERA: True
+  SIE_COE : 1.0
+  PROMPT_LEN: 10
+  PROMPT_DEP: 12
+INPUT:
+  SIZE_TRAIN: [256, 128]
+  SIZE_TEST: [256, 128]
+  PROB: 0.5 # random horizontal flip
+  RE_PROB: 0.5 # random erasing
+  PADDING: 10
+  PIXEL_MEAN: [0.5, 0.5, 0.5]
+  PIXEL_STD: [0.5, 0.5, 0.5]
+  SEQ_LEN: 8
+
+DATALOADER:
+  SAMPLER: 'softmax_triplet'
+  NUM_INSTANCE: 4
+  NUM_WORKERS: 8
+
+SOLVER:
+  STAGE1:
+    IMS_PER_BATCH: 64
+    OPTIMIZER_NAME: "Adam"
+    BASE_LR: 0.0035
+    WARMUP_LR_INIT: 0.0001
+    LR_MIN: 1e-6
+    WARMUP_METHOD: 'linear'
+    WEIGHT_DECAY:  1e-4
+    WEIGHT_DECAY_BIAS: 1e-4
+    MAX_EPOCHS: 120
+    CHECKPOINT_PERIOD: 120
+    LOG_PERIOD: 50
+    WARMUP_EPOCHS: 5
+  
+  STAGE2:
+    IMS_PER_BATCH: 8
+    OPTIMIZER_NAME: "Adam"
+    BASE_LR: 0.000005
+    WARMUP_METHOD: 'linear'
+    WARMUP_ITERS: 10
+    WARMUP_FACTOR: 0.1
+    WEIGHT_DECAY:  0.0001
+    WEIGHT_DECAY_BIAS: 0.0001
+    LARGE_FC_LR: True
+    MAX_EPOCHS: 80
+    CHECKPOINT_PERIOD: 60
+    LOG_PERIOD: 50
+    EVAL_PERIOD: 2
+    BIAS_LR_FACTOR: 2
+    
+    STEPS: [30, 50, 70]
+    GAMMA: 0.1
+  
+TEST:
+  EVAL: False
+  IMS_PER_BATCH: 1
+  RE_RANKING: True
+  WEIGHT: '/best_model.pth.tar'
+  NECK_FEAT: 'before'
+  FEAT_NORM: 'yes'
+
+DATASETS:
+  NAMES: ('mars')
+  # 修改点 1: 数据集根目录。
+  # 根据标准逻辑，这里填 '/data1/zjj_data'，代码会自动寻找 '/data1/zjj_data/mars'
+  # 如果报错找不到图片，请尝试改为 '/data1/zjj_data/mars'
+  ROOT_DIR: ('/data1/zjj_data')
+  
+  # 修改点 2: 属性文件路径
+  # 假设你的 attr 文件夹内文件名是 train.json 和 test.json (根据 README)
+  TRAIN_ATTR: '/data1/zjj_data/mars/attr/train.json'
+  TEST_ATTR: '/data1/zjj_data/mars/attr/test.json'
+  
+  # 修改点 3: Stage 1 特征缓存路径
+  # 这个文件是训练生成的，建议放在输出目录或数据集目录，这里我设为放在数据集目录下方便管理
+  STAGE1_IMG_FEAT: '/data1/zjj_data/mars/image_features_stage1_mars.pth'
+
+# 修改点 4: 输出日志和模型的路径
+# 确保这个目录存在，或者代码有权限创建它
+OUTPUT_DIR: 'logs/Mars_MM_test'
+# 
