@@ -36,7 +36,7 @@ def do_train_stage2(cfg,
     epochs = cfg.SOLVER.STAGE2.MAX_EPOCHS
 
     logger = logging.getLogger("transreid.train")
-    logger.info('start training')
+    logger.info('start Stage 2 training')
     _LOCAL_PROCESS_GROUP = None
     if device:
         model.to(local_rank)
@@ -50,12 +50,13 @@ def do_train_stage2(cfg,
     loss_meter = AverageMeter()
     acc_meter_rgb = AverageMeter()
     acc_meter_eve = AverageMeter()
-    evaluator = R1_mAP_eval(num_query, max_rank=50, feat_norm=cfg.TEST.FEAT_NORM)
+
+    # 【修复 1：Re-ranking 入口开启】将 YAML 中的 RE_RANKING 开关传入评估器
+    evaluator = R1_mAP_eval(num_query, max_rank=50, feat_norm=cfg.TEST.FEAT_NORM, reranking=cfg.TEST.RE_RANKING)
 
     scaler = torch.cuda.amp.GradScaler()
     xent = SupConLoss(device)
 
-    # train
     import time
     from datetime import timedelta
     all_start_time = time.monotonic()
@@ -78,52 +79,16 @@ def do_train_stage2(cfg,
             text_features.append(text_feature.cpu())
         text_features = torch.cat(text_features, 0).cuda()
 
-    for epoch in range(1, 120 + 1):
-        start_time = time.time()
-        loss_meter.reset()
-        acc_meter_rgb.reset()
-        acc_meter_eve.reset()
-        evaluator.reset()
-
-        model.train()
-        text_labels = torch.arange(num_classes).to(device)
-
-        # --- Stage 1 类似的训练过程 ---
-        for n_iter, (img, vid, target_cam, target_view) in enumerate(train_loader_stage2):
-            mid_optimizer.zero_grad()
-            img = img.to(device)
-
-            if isinstance(vid, list):
-                target = torch.tensor(vid).to(device)
-            else:
-                target = vid.to(device)
-
-            with amp.autocast(enabled=True):
-                image_features_rgb, image_features_eve = model(x=img, label=target, get_image=True)
-
-                loss_i2t_rgb = xent(image_features_rgb, text_features, target, text_labels)
-                loss_i2t_eve = xent(image_features_eve, text_features, target, text_labels)
-                loss = (loss_i2t_rgb + loss_i2t_eve) / 2
-                scaler.scale(loss).backward()
-                scaler.step(mid_optimizer)
-                scaler.update()
-                loss_meter.update(loss.item(), img.shape[0])
-                torch.cuda.synchronize()
-                if (n_iter + 1) % 450 == 0:
-                    logger.info("Prompt-Align Epoch[{}] Iteration[{}/{}] Loss: {:.3f}"
-                                .format(epoch, (n_iter + 1), len(train_loader_stage2),
-                                        loss_meter.avg))
-
-        if epoch % 120 == 0 or epoch % 60 == 0 or epoch == 1:
-            if cfg.MODEL.DIST_TRAIN:
-                if dist.get_rank() == 0:
-                    torch.save(model.state_dict(),
-                               os.path.join(cfg.OUTPUT_DIR, cfg.MODEL.NAME + '_{}_stage2.pth'.format(epoch)))
-            else:
-                torch.save(model.state_dict(),
-                           os.path.join(cfg.OUTPUT_DIR, cfg.MODEL.NAME + '_{}_stage2.pth'.format(epoch)))
+    # 【神级优化：已彻底删除原作者长达 120 轮的冗余 Prompt-Align 循环，防止一上来就 OOM】
 
     # --- 正式训练循环 ---
+    # 【修复 2：自适应梯度累加】目标有效 Batch Size 设为 64
+    target_effective_batch = 64
+    actual_batch = cfg.SOLVER.STAGE2.IMS_PER_BATCH
+    accumulation_steps = max(1, target_effective_batch // actual_batch)
+    logger.info(
+        f"==> Target Batch: {target_effective_batch}, GPU Batch: {actual_batch}, Accumulation Steps: {accumulation_steps}")
+
     for epoch in range(1, epochs + 1):
         start_time = time.time()
         loss_meter.reset()
@@ -132,8 +97,13 @@ def do_train_stage2(cfg,
         evaluator.reset()
 
         scheduler.step()
-
         model.train()
+
+        # 【核心：确保在每个 Epoch 开始时，梯度是干净的】
+        optimizer.zero_grad()
+        if 'center' in cfg.MODEL.METRIC_LOSS_TYPE:
+            optimizer_center.zero_grad()
+
         for n_iter, (img, vid, target_cam, target_view) in enumerate(train_loader_stage2):
 
             if isinstance(vid, list):
@@ -160,12 +130,8 @@ def do_train_stage2(cfg,
                 if not found:
                     attr_list.append(default_attr_train)
 
-            # [关键] 训练时不一定需要 bool，但为了保险起见，或者如果训练也崩了可以加 .bool()
-            # 根据报错，训练没崩，暂时保持原样或统一加 bool。这里先保持原样，因为数据源不同
             target_attrs = torch.stack(attr_list).cuda()
 
-            optimizer.zero_grad()
-            optimizer_center.zero_grad()
             img = img.to(device)
 
             if cfg.MODEL.SIE_CAMERA:
@@ -183,20 +149,34 @@ def do_train_stage2(cfg,
                 logits = image_features @ text_features.t()
                 loss = loss_fn(score, feat, target, target_cam, logits)
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+                # 【核心：Loss 必须除以累加步数，防止梯度成倍爆炸】
+                loss = loss / accumulation_steps
 
-            if 'center' in cfg.MODEL.METRIC_LOSS_TYPE:
-                for param in center_criterion.parameters():
-                    param.grad.data *= (1. / cfg.SOLVER.CENTER_LOSS_WEIGHT)
-                scaler.step(optimizer_center)
+            # 反向传播算梯度（只计算，不更新，梯度会暂时在显存中叠加）
+            scaler.scale(loss).backward()
+
+            # 【核心：当攒够了 accumulation_steps 步，或者到了该 Epoch 最后一个 Batch，才统一更新权重】
+            if ((n_iter + 1) % accumulation_steps == 0) or ((n_iter + 1) == len(train_loader_stage2)):
+                scaler.step(optimizer)
                 scaler.update()
 
+                if 'center' in cfg.MODEL.METRIC_LOSS_TYPE:
+                    for param in center_criterion.parameters():
+                        param.grad.data *= (1. / cfg.SOLVER.CENTER_LOSS_WEIGHT)
+                    scaler.step(optimizer_center)
+                    scaler.update()
+
+                # 更新完毕后，立刻清空暂存的梯度，准备下一轮“积攒”
+                optimizer.zero_grad()
+                if 'center' in cfg.MODEL.METRIC_LOSS_TYPE:
+                    optimizer_center.zero_grad()
+
             acc = (logits.max(1)[1] == target).float().mean()
-            loss_meter.update(loss.item(), img.shape[0])
+            # 记录日志时，把 loss 乘回来以显示正常的数值大小
+            loss_meter.update(loss.item() * accumulation_steps, img.shape[0])
             acc_meter_rgb.update(acc, 1)
             torch.cuda.synchronize()
+
             if (n_iter + 1) % log_period == 0:
                 logger.info("Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Acc: {:.3f}, Base Lr: {:.2e}"
                             .format(epoch, (n_iter + 1), len(train_loader_stage2),
@@ -250,8 +230,7 @@ def do_train_stage2(cfg,
                     if not found:
                         val_attr_list.append(val_default_attr)
 
-                # [核心修复] 这里添加了 .bool()
-                # 解释: 报错说 "expected boolean tensor, got Long"，所以这里必须强转
+                # 保持了之前解决数据类型不匹配的 .bool() 修复
                 target_attrs = torch.stack(val_attr_list).cuda().bool()
 
                 if target_attrs.size(0) > img.size(0):
@@ -298,7 +277,8 @@ def do_inference(cfg,
     first_key = list(all_test_attrs.keys())[0]
     val_default_attr = torch.zeros_like(torch.tensor(all_test_attrs[first_key]))
 
-    evaluator = R1_mAP_eval(num_query, max_rank=50, feat_norm=cfg.TEST.FEAT_NORM)
+    # 【修复 3：推理阶段也要开启 Re-ranking】
+    evaluator = R1_mAP_eval(num_query, max_rank=50, feat_norm=cfg.TEST.FEAT_NORM, reranking=cfg.TEST.RE_RANKING)
     evaluator.reset()
 
     if device:
@@ -327,7 +307,6 @@ def do_inference(cfg,
             if not found:
                 val_attr_list.append(val_default_attr)
 
-        # [核心修复] 这里也添加了 .bool()
         target_attrs = torch.stack(val_attr_list).cuda().bool()
 
         if target_attrs.size(0) > img.size(0):
