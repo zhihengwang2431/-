@@ -65,7 +65,7 @@ SOLVER:
 TEST:
   EVAL: False
   IMS_PER_BATCH: 1
-  RE_RANKING: True
+  RE_RANKING: False
   WEIGHT: '/best_model.pth.tar'
   NECK_FEAT: 'before'
   FEAT_NORM: 'yes'
