@@ -35,22 +35,25 @@ def do_train_stage1(cfg,
             model = nn.DataParallel(model)
 
     loss_meter = AverageMeter()
+    loss_meter_attr = AverageMeter()
+    # scaler = torch.amp.GradScaler('cuda')
+    # 修改后
     scaler = torch.cuda.amp.GradScaler()
     xent = SupConLoss(device)
 
+    import os
+    # train
     import time
     from datetime import timedelta
     save_path = os.path.join(image_pth)
     all_start_time = time.monotonic()
-
-    # ------------------- 特征提取与加载 -------------------
     if os.path.exists(save_path):
         logger.info(f"Loading precomputed features from {save_path}")
         features = torch.load(save_path)
-        labels_list = features['labels'].cuda()
-        image_features_list_rgb = features['rgb'].cuda()
-        image_features_list_eve = features['eve'].cuda()
-        image_pids = features['pids']
+        labels_list = features['labels'].cuda()  # Tensor [N]
+        image_features_list_rgb = features['rgb'].cuda()  # Tensor [N, D]
+        image_features_list_eve = features['eve'].cuda()  # Tensor [N, D]
+        image_pids = features['pids']  # List[str]
     else:
         logger.info("Start Stage 1 feature extraction...")
         image_features_rgb = []
@@ -75,26 +78,25 @@ def do_train_stage1(cfg,
                         labels.append(i)
                         image_features_rgb.append(img_feat_rgb.cpu())
                         image_features_eve.append(img_feat_eve.cpu())
-
         labels_list = torch.stack(labels, dim=0).cuda()
         image_features_list_rgb = torch.stack(image_features_rgb, dim=0).cuda()
         image_features_list_eve = torch.stack(image_features_eve, dim=0).cuda()
         del labels, image_feature_rgb, image_feature_eve
-
+        # 保存所有内容，包括 image_pids（注意它是 list[str]，不用 stack）
         torch.save({
             'labels': labels_list.cpu(),
             'rgb': image_features_list_rgb.cpu(),
             'eve': image_features_list_eve.cpu(),
             'pids': image_pids
         }, save_path)
+        logger.info(f"Saved features to {save_path}")
 
-    # ------------------- 模型主训练循环 -------------------
     batch = cfg.SOLVER.STAGE1.IMS_PER_BATCH
     num_image = labels_list.shape[0]
     i_ter = num_image // batch
-
     for epoch in range(1, epochs + 1):
         loss_meter.reset()
+        loss_meter_attr.reset()
         scheduler.step(epoch)
         model.train()
 
@@ -110,45 +112,87 @@ def do_train_stage1(cfg,
             target_attrs = torch.stack([pid2attrs[image_pids[b]] for b in b_list]).cuda()
             image_features_rgb = image_features_list_rgb[b_list]
             image_features_eve = image_features_list_eve[b_list]
-
             with torch.amp.autocast('cuda'):
-                text_features, attrs_feat = model(label=target, target_attrs=target_attrs, get_text=True)
-                attrs_feat = attrs_feat.mean(dim=1)
+                text_features, _ = model(label=target, target_attrs=target_attrs, get_text=True)
+            loss_i2t_rgb = xent(image_features_rgb, text_features, target, target)
+            loss_t2i_rgb = xent(text_features, image_features_rgb, target, target)
 
-                # 【神级修复】：不单独算属性Loss，而是将属性特征融合到身份文本特征中
-                fused_text_features = text_features + 0.3 * attrs_feat
-                fused_text_features = F.normalize(fused_text_features, p=2, dim=1)
-
-            # ======== 新增：修复 AMP 数据类型不匹配报错 ========
-            # 强制将所有特征统一转换为单精度浮点数 (FP32)，保证算 Loss 时的数据对齐与数值稳定
-            fused_text_features = fused_text_features.float()
-            image_features_rgb = image_features_rgb.float()
-            image_features_eve = image_features_eve.float()
-            # ==================================================
-
-            # 使用融合了属性语义的文本特征进行对比学习
-            loss_i2t_rgb = xent(image_features_rgb, fused_text_features, target, target)
-            loss_t2i_rgb = xent(fused_text_features, image_features_rgb, target, target)
-            loss_i2t_eve = xent(image_features_eve, fused_text_features, target, target)
-            loss_t2i_eve = xent(fused_text_features, image_features_eve, target, target)
+            loss_i2t_eve = xent(image_features_eve, text_features, target, target)
+            loss_t2i_eve = xent(text_features, image_features_eve, target, target)
 
             loss = (loss_i2t_rgb + loss_t2i_rgb + loss_i2t_eve + loss_t2i_eve) / 2
-
             scaler.scale(loss).backward()
+
             scaler.step(optimizer)
             scaler.update()
 
             loss_meter.update(loss.item(), batch)
             torch.cuda.synchronize()
-
             if (i + 1) % log_period == 0:
-                logger.info("Epoch[{}] Iteration[{}/{}] Total Loss: {:.3f}, Base Lr: {:.2e}"
+                logger.info("Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Base Lr: {:.2e}"
                             .format(epoch, (i + 1), len(train_loader_stage1),
                                     loss_meter.avg, scheduler._get_lr(epoch)[0]))
 
         if epoch % checkpoint_period == 0:
-            torch.save(model.state_dict(),
-                       os.path.join(cfg.OUTPUT_DIR, cfg.MODEL.NAME + '_stage1_{}.pth'.format(epoch)))
+            if cfg.MODEL.DIST_TRAIN:
+                if dist.get_rank() == 0:
+                    torch.save(model.state_dict(),
+                               os.path.join(cfg.OUTPUT_DIR, cfg.MODEL.NAME + '_stage1_{}.pth'.format(epoch)))
+            else:
+                torch.save(model.state_dict(),
+                           os.path.join(cfg.OUTPUT_DIR, cfg.MODEL.NAME + '_stage1_{}.pth'.format(epoch)))
+
+    all_end_time = time.monotonic()
+    total_time = timedelta(seconds=all_end_time - all_start_time)
+    logger.info("Stage1 running time: {}".format(total_time))
+
+    # for epoch in range(1, epochs * 2 + 1):
+    #     loss_meter.reset()
+    #     scheduler.step(epoch)
+    #     model.train()
+
+    #     iter_list = torch.randperm(num_image).to(device)
+    #     for i in range(i_ter+1):
+    #         optimizer.zero_grad()
+    #         if i != i_ter:
+    #             b_list = iter_list[i*batch:(i+1)* batch]
+    #         else:
+    #             b_list = iter_list[i*batch:num_image]
+
+    #         target = labels_list[b_list]
+    #         target_attrs = torch.stack([pid2attrs[image_pids[b]] for b in b_list]).cuda()
+    #         image_features_rgb = image_features_list_rgb[b_list]
+    #         image_features_eve = image_features_list_eve[b_list]
+    #         with torch.amp.autocast('cuda'):
+    #             _, attrs_feat = model(label = target, target_attrs = target_attrs, get_text = True)
+    #         attrs_feat = attrs_feat.mean(dim=1)
+    #         loss_i2t_rgb_attr = xent(image_features_rgb, attrs_feat, target, target)
+    #         loss_t2i_rgb_attr = xent(attrs_feat, image_features_rgb, target, target)
+
+    #         loss_i2t_eve_attr = xent(image_features_eve, attrs_feat, target, target)
+    #         loss_t2i_eve_attr = xent(attrs_feat, image_features_eve, target, target)
+
+    #         loss = (loss_i2t_rgb_attr + loss_t2i_rgb_attr + loss_i2t_eve_attr + loss_t2i_eve_attr)/2
+    #         scaler.scale(loss).backward()
+
+    #         scaler.step(optimizer)
+    #         scaler.update()
+
+    #         loss_meter.update(loss.item(), batch)
+    #         torch.cuda.synchronize()
+    #         if (i + 1) % log_period == 0:
+    #             logger.info("Attributes----Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Base Lr: {:.2e}"
+    #                         .format(epoch, (i + 1), len(train_loader_stage1),
+    #                                 loss_meter.avg, scheduler._get_lr(epoch)[0]))
+
+    #     if epoch % checkpoint_period == 0:
+    #         if cfg.MODEL.DIST_TRAIN:
+    #             if dist.get_rank() == 0:
+    #                 torch.save(model.state_dict(),
+    #                            os.path.join(cfg.OUTPUT_DIR, cfg.MODEL.NAME + '_attr_stage1_{}.pth'.format(epoch)))
+    #         else:
+    #             torch.save(model.state_dict(),
+    #                        os.path.join(cfg.OUTPUT_DIR, cfg.MODEL.NAME + '_attr_stage1_{}.pth'.format(epoch)))
 
     all_end_time = time.monotonic()
     total_time = timedelta(seconds=all_end_time - all_start_time)
