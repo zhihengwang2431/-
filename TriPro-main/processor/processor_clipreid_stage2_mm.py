@@ -10,7 +10,6 @@ import torch.distributed as dist
 from torch.nn import functional as F
 from loss.supcontrast import SupConLoss
 import json
-import random
 
 
 def do_train_stage2(cfg,
@@ -50,9 +49,8 @@ def do_train_stage2(cfg,
     loss_meter = AverageMeter()
     acc_meter_rgb = AverageMeter()
     acc_meter_eve = AverageMeter()
-    evaluator = R1_mAP_eval(num_query, max_rank=50, feat_norm=cfg.TEST.FEAT_NORM, reranking=cfg.TEST.RE_RANKING)
-
-    scaler = torch.cuda.amp.GradScaler()
+    evaluator = R1_mAP_eval(num_query, max_rank=50, feat_norm=cfg.TEST.FEAT_NORM)
+    scaler = amp.GradScaler()
     xent = SupConLoss(device)
 
     # train
@@ -60,7 +58,7 @@ def do_train_stage2(cfg,
     from datetime import timedelta
     all_start_time = time.monotonic()
 
-    # 预计算文本特征
+    # train
     batch = cfg.SOLVER.STAGE2.IMS_PER_BATCH
     i_ter = num_classes // batch
     left = num_classes - batch * (num_classes // batch)
@@ -86,23 +84,20 @@ def do_train_stage2(cfg,
         evaluator.reset()
 
         model.train()
-        text_labels = torch.arange(num_classes).to(device)
+        text_labels = torch.arange(num_classes).to(device)  # [0, 1, ..., 624]
 
-        # --- Stage 1 类似的训练过程 ---
         for n_iter, (img, vid, target_cam, target_view) in enumerate(train_loader_stage2):
             mid_optimizer.zero_grad()
             img = img.to(device)
-
-            if isinstance(vid, list):
-                target = torch.tensor(vid).to(device)
-            else:
-                target = vid.to(device)
+            target = vid.to(device)
 
             with amp.autocast(enabled=True):
                 image_features_rgb, image_features_eve = model(x=img, label=target, get_image=True)
 
                 loss_i2t_rgb = xent(image_features_rgb, text_features, target, text_labels)
+                # loss_t2i_rgb = xent(text_features, image_features_rgb, text_labels, target)
                 loss_i2t_eve = xent(image_features_eve, text_features, target, text_labels)
+                # loss_t2i_eve = xent(text_features, image_features_eve, text_labels, target)
                 loss = (loss_i2t_rgb + loss_i2t_eve) / 2
                 scaler.scale(loss).backward()
                 scaler.step(mid_optimizer)
@@ -113,7 +108,6 @@ def do_train_stage2(cfg,
                     logger.info("Prompt-Align Epoch[{}] Iteration[{}/{}] Loss: {:.3f}"
                                 .format(epoch, (n_iter + 1), len(train_loader_stage2),
                                         loss_meter.avg))
-
         if epoch % 120 == 0 or epoch % 60 == 0 or epoch == 1:
             if cfg.MODEL.DIST_TRAIN:
                 if dist.get_rank() == 0:
@@ -123,7 +117,6 @@ def do_train_stage2(cfg,
                 torch.save(model.state_dict(),
                            os.path.join(cfg.OUTPUT_DIR, cfg.MODEL.NAME + '_{}_stage2.pth'.format(epoch)))
 
-    # --- 正式训练循环 ---
     for epoch in range(1, epochs + 1):
         start_time = time.time()
         loss_meter.reset()
@@ -135,38 +128,13 @@ def do_train_stage2(cfg,
 
         model.train()
         for n_iter, (img, vid, target_cam, target_view) in enumerate(train_loader_stage2):
-
-            if isinstance(vid, list):
-                current_batch_labels = vid
-                target = torch.tensor(vid).to(device)
-            else:
-                current_batch_labels = vid.tolist()
-                target = vid.to(device)
-
-            attr_list = []
-            default_attr_train = torch.zeros_like(list(pid2attrs.values())[0])
-
-            for label in current_batch_labels:
-                found = False
-                if label in label2pid:
-                    real_pid = label2pid[label]
-                    keys_to_try = [str(real_pid).zfill(4), str(real_pid)]
-                    for k in keys_to_try:
-                        if k in pid2attrs:
-                            attr_list.append(pid2attrs[k])
-                            found = True
-                            break
-
-                if not found:
-                    attr_list.append(default_attr_train)
-
-            # [关键] 训练时不一定需要 bool，但为了保险起见，或者如果训练也崩了可以加 .bool()
-            # 根据报错，训练没崩，暂时保持原样或统一加 bool。这里先保持原样，因为数据源不同
-            target_attrs = torch.stack(attr_list).cuda()
+            image_pids = [str(label2pid[int(id)]).zfill(4) for id in vid]
+            target_attrs = torch.stack([pid2attrs[pid] for pid in image_pids]).cuda()
 
             optimizer.zero_grad()
             optimizer_center.zero_grad()
             img = img.to(device)
+            target = vid.to(device)
 
             if cfg.MODEL.SIE_CAMERA:
                 target_cam = target_cam.to(device)
@@ -176,14 +144,13 @@ def do_train_stage2(cfg,
                 target_view = target_view.to(device)
             else:
                 target_view = None
-
             with amp.autocast(enabled=True):
                 score, feat, image_features = model(x=img, label=target, cam_label=target_cam, view_label=target_view,
                                                     target_attrs=target_attrs)
                 logits = image_features @ text_features.t()
                 loss = loss_fn(score, feat, target, target_cam, logits)
-
             scaler.scale(loss).backward()
+
             scaler.step(optimizer)
             scaler.update()
 
@@ -219,64 +186,62 @@ def do_train_stage2(cfg,
                 torch.save(model.state_dict(),
                            os.path.join(cfg.OUTPUT_DIR, cfg.MODEL.NAME + '_{}.pth'.format(epoch)))
 
-        # --- 验证循环 ---
+        if not os.path.exists(test_attrs):
+            raise FileNotFoundError("Test attribute file not found!")
+
+        with open(test_attrs, 'r') as f:
+            all_target_attrs = json.load(f)
+
         if epoch % eval_period == 0:
-            if not os.path.exists(test_attrs):
-                raise FileNotFoundError("Test attribute file not found!")
+            if cfg.MODEL.DIST_TRAIN:
+                if dist.get_rank() == 0:
+                    model.eval()
+                    for n_iter, (img, vid, camid, camids, target_view, _) in enumerate(val_loader):
 
-            with open(test_attrs, 'r') as f:
-                all_test_attrs = json.load(f)
+                        batch_attrs = all_target_attrs[n_iter]
+                        target_attrs = torch.tensor(batch_attrs).cuda()
+                        with torch.no_grad():
+                            img = img.to(device)
+                            if cfg.MODEL.SIE_CAMERA:
+                                camids = camids.to(device)
+                            else:
+                                camids = None
+                            if cfg.MODEL.SIE_VIEW:
+                                target_view = target_view.to(device)
+                            else:
+                                target_view = None
+                            feat = model(img, cam_label=camids, view_label=target_view, target_attrs=target_attrs)
+                            evaluator.update((feat, vid, camid))
+                    cmc, mAP, _, _, _, _, _ = evaluator.compute()
+                    logger.info("Validation Results - Epoch: {}".format(epoch))
+                    logger.info("mAP: {:.1%}".format(mAP))
+                    for r in [1, 5, 10]:
+                        logger.info("CMC curve, Rank-{:<3}:{:.1%}".format(r, cmc[r - 1]))
+                    torch.cuda.empty_cache()
+            else:
+                model.eval()
+                for n_iter, (img, vid, camid, camids, target_view, _) in enumerate(val_loader):
+                    batch_attrs = all_target_attrs[n_iter]
+                    target_attrs = torch.tensor(batch_attrs).cuda()
+                    with torch.no_grad():
+                        img = img.to(device)
+                        if cfg.MODEL.SIE_CAMERA:
+                            camids = camids.to(device)
+                        else:
+                            camids = None
+                        if cfg.MODEL.SIE_VIEW:
+                            target_view = target_view.to(device)
+                        else:
+                            target_view = None
+                        feat = model(img, cam_label=camids, view_label=target_view, target_attrs=target_attrs)
+                        evaluator.update((feat, vid, camid))
 
-            first_key = list(all_test_attrs.keys())[0]
-            val_default_attr = torch.zeros_like(torch.tensor(all_test_attrs[first_key]))
-
-            model.eval()
-            for n_iter, (img, vid, camid, camids, target_view, _) in enumerate(val_loader):
-
-                if isinstance(vid, list):
-                    current_batch_pids = vid
-                else:
-                    current_batch_pids = vid.tolist()
-
-                val_attr_list = []
-                for pid in current_batch_pids:
-                    found = False
-                    keys_to_try = [str(pid).zfill(4), str(pid)]
-                    for k in keys_to_try:
-                        if k in all_test_attrs:
-                            val_attr_list.append(torch.tensor(all_test_attrs[k]))
-                            found = True
-                            break
-                    if not found:
-                        val_attr_list.append(val_default_attr)
-
-                # [核心修复] 这里添加了 .bool()
-                # 解释: 报错说 "expected boolean tensor, got Long"，所以这里必须强转
-                target_attrs = torch.stack(val_attr_list).cuda().bool()
-
-                if target_attrs.size(0) > img.size(0):
-                    target_attrs = target_attrs[:img.size(0)]
-
-                with torch.no_grad():
-                    img = img.to(device)
-                    if cfg.MODEL.SIE_CAMERA:
-                        camids = camids.to(device)
-                    else:
-                        camids = None
-                    if cfg.MODEL.SIE_VIEW:
-                        target_view = target_view.to(device)
-                    else:
-                        target_view = None
-                    feat = model(img, cam_label=camids, view_label=target_view, target_attrs=target_attrs)
-                    evaluator.update((feat, vid, camid))
-
-            cmc, mAP, _, _, _, _, _ = evaluator.compute()
-            logger.info("Validation Results - Epoch: {}".format(epoch))
-            logger.info("mAP: {:.1%}".format(mAP))
-            for r in [1, 5, 10]:
-                logger.info("CMC curve, Rank-{:<3}:{:.1%}".format(r, cmc[r - 1]))
-            torch.cuda.empty_cache()
-
+                cmc, mAP, _, _, _, _, _ = evaluator.compute()
+                logger.info("Validation Results - Epoch: {}".format(epoch))
+                logger.info("mAP: {:.1%}".format(mAP))
+                for r in [1, 5, 10]:
+                    logger.info("CMC curve, Rank-{:<3}:{:.1%}".format(r, cmc[r - 1]))
+                torch.cuda.empty_cache()
     all_end_time = time.monotonic()
     total_time = timedelta(seconds=all_end_time - all_start_time)
     logger.info("Total running time: {}".format(total_time))
@@ -291,14 +256,11 @@ def do_inference(cfg,
     device = "cuda"
     logger = logging.getLogger("transreid.test")
     logger.info("Enter inferencing")
-
     with open(test_attrs, 'r') as f:
-        all_test_attrs = json.load(f)
-
-    first_key = list(all_test_attrs.keys())[0]
-    val_default_attr = torch.zeros_like(torch.tensor(all_test_attrs[first_key]))
+        all_target_attrs = json.load(f)
 
     evaluator = R1_mAP_eval(num_query, max_rank=50, feat_norm=cfg.TEST.FEAT_NORM)
+
     evaluator.reset()
 
     if device:
@@ -308,43 +270,24 @@ def do_inference(cfg,
         model.to(device)
 
     model.eval()
+    img_path_list = []
 
     for n_iter, (img, vid, camid, camids, target_view, imgpath) in enumerate(val_loader):
-        if isinstance(vid, list):
-            current_batch_pids = vid
-        else:
-            current_batch_pids = vid.tolist()
-
-        val_attr_list = []
-        for pid in current_batch_pids:
-            found = False
-            keys_to_try = [str(pid).zfill(4), str(pid)]
-            for k in keys_to_try:
-                if k in all_test_attrs:
-                    val_attr_list.append(torch.tensor(all_test_attrs[k]))
-                    found = True
-                    break
-            if not found:
-                val_attr_list.append(val_default_attr)
-
-        # [核心修复] 这里也添加了 .bool()
-        target_attrs = torch.stack(val_attr_list).cuda().bool()
-
-        if target_attrs.size(0) > img.size(0):
-            target_attrs = target_attrs[:img.size(0)]
-
         with torch.no_grad():
-            img = img.to(device)
-            if cfg.MODEL.SIE_CAMERA:
-                camids = camids.to(device)
-            else:
-                camids = None
-            if cfg.MODEL.SIE_VIEW:
-                target_view = target_view.to(device)
-            else:
-                target_view = None
-            feat = model(img, cam_label=camids, view_label=target_view, target_attrs=target_attrs)
-            evaluator.update((feat, vid, camid))
+            batch_attrs = all_target_attrs[n_iter]
+            target_attrs = torch.tensor(batch_attrs).cuda()
+            with torch.no_grad():
+                img = img.to(device)
+                if cfg.MODEL.SIE_CAMERA:
+                    camids = camids.to(device)
+                else:
+                    camids = None
+                if cfg.MODEL.SIE_VIEW:
+                    target_view = target_view.to(device)
+                else:
+                    target_view = None
+                feat = model(img, cam_label=camids, view_label=target_view, target_attrs=target_attrs)
+                evaluator.update((feat, vid, camid))
 
     cmc, mAP, _, _, _, _, _ = evaluator.compute()
     logger.info("Validation Results ")
